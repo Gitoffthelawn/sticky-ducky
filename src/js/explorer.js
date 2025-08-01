@@ -1,5 +1,8 @@
 'use strict';
 
+// TODO: Replace iframes and CSSWhat with PostCSS https://postcss.org/api/
+// This would solve the issues with CORS and allow using this from the service worker which doesn't have access to the DOM.
+
 let isDataURL = url => /^\s*data:/i.test(url);
 
 // These functions recursively call each other. It is important both to handle the failures and process
@@ -85,7 +88,8 @@ class Explorer {
                 document.body.appendChild(iframe);
                 let iframeDoc = iframe.contentDocument;
                 // We need base for @import with relative urls. BaseURI may be on a different domain than href.
-                iframeDoc.head.appendChild(iframeDoc.createElement('base')).href = nestedBaseURI;
+                // Commented out because this doesn't play well with CSP.
+                // iframeDoc.head.appendChild(iframeDoc.createElement('base')).href = nestedBaseURI;
                 let style = iframeDoc.head.appendChild(iframeDoc.createElement('style'));
                 style.textContent = text;
                 return this.exploreRules(style.sheet, absoluteURL);

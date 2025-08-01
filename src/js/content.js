@@ -1,4 +1,32 @@
 'use strict';
+
+let settings = {
+    // This a reference for the settings structure. The values will be updated.
+    isDevelopment: false,
+    behavior: 'scroll',
+    whitelist: {
+        type: 'none',  // ['none', 'page', 'selectors']
+        selectors: []  // optional, if the type is 'selectors'
+    },
+    transitionDuration: 0.2,  // Duration of show/hide animation
+    typesToShow: ['sidebar', 'splash', 'hidden']  // Hidden is here for caution - dimensions of a hidden element are unknown, and it cannot be classified
+};
+
+function internalLog(logger, ...args) {
+    if (settings.isDevelopment) {
+        logger('Sticky Ducky: ', ...args);
+    }
+}
+
+const log = (...args) => internalLog(console.log, ...args);
+const warn = (...args) => internalLog(console.warn, ...args);
+const error = (...args) => internalLog(console.error, ...args);
+
+log('Content script starting...');
+log('_ available:', typeof _ !== 'undefined');
+log('CSSWhat available:', typeof CSSWhat !== 'undefined');
+
+
 let exploration = {
     limit: 2,  // Limit for exploration on shorter scroll distance
     lastScrollY: 0,  // Keeps track of the scroll position during the last exploration
@@ -12,20 +40,66 @@ let exploration = {
         pseudoElements: []
     }
 };
-let settings = {
-    // This a reference for the settings structure. The values will be updated.
-    isDevelopment: false,
-    behavior: 'scroll',
-    whitelist: {
-        type: 'none',  // ['none', 'page', 'selectors']
-        selectors: []  // optional, if the type is 'selectors'
-    },
-    transitionDuration: 0.2,  // Duration of show/hide animation
-    typesToShow: ['sidebar', 'splash', 'hidden']  // Hidden is here for caution - dimensions of a hidden element are unknown, and it cannot be classified
-};
 let lastKnownScrollY = undefined;
 let stickyFixer = null;
 let scrollListener = _.debounce(_.throttle(ev => doAll(false, false, ev), 300), 50);  // Debounce delay makes it run after the page scroll listeners
+
+
+// Helper function to send messages to service worker with retry logic
+async function sendMessageToServiceWorker(message, retries = 3) {
+    for (let i = 0; i < retries; i++) {
+        try {
+            log('Sending message to service worker (attempt', i + 1, '):', message.name);
+            const response = await chrome.runtime.sendMessage(message);
+            log('Service worker response received:', response);
+            return response;
+        } catch (err) {
+            warn('Message send failed (attempt', i + 1, '):', err.message);
+            
+            if (err.message.includes('Could not establish connection') || 
+            err.message.includes('Receiving end does not exist')) {
+                
+                if (i < retries - 1) {
+                    // Wait a bit before retrying to let service worker wake up
+                    log('Waiting 200ms before retry...');
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    continue;
+                } else {
+                    error('Service worker not responding after', retries, 'attempts');
+                    throw new Error('Service worker not responding');
+                }
+            } else {
+                // For other errors, don't retry
+                throw err;
+            }
+        }
+    }
+}
+
+// Centralized function to refresh settings from service worker
+async function refreshSettings(context = 'unknown') {
+    try {
+        log('Refreshing settings from context:', context);
+        const locationData = _.omit(window.location, _.isFunction);
+        const response = await sendMessageToServiceWorker({
+            name: 'getSettings',
+            message: {location: locationData}
+        });
+        
+        log('Settings response from', context + ':', response);
+        if (response && response.name === 'settings') {
+            log('Processing settings from', context);
+            onNewSettings(response.message);
+            return true;
+        } else {
+            warn('Invalid settings response from', context);
+            return false;
+        }
+    } catch (err) {
+        error('Failed to refresh settings from', context + ':', err);
+        return false;
+    }
+}
 
 class StickyFixer {
     constructor(stylesheet, state, getNewState, makeSelectorForHidden, hiddenStyle) {
@@ -132,7 +206,7 @@ let fixers = {
     },
     'scroll': {
         getNewState: (defaultState, {scrollY, oldState}) => {
-            log('scroll decision', defaultState, scrollY, lastKnownScrollY, oldState);
+            log('Scroll decision', defaultState, scrollY, lastKnownScrollY, oldState);
             return scrollY === lastKnownScrollY && oldState
                 || scrollY < lastKnownScrollY && 'show'
                 || defaultState
@@ -179,12 +253,6 @@ function getDocumentHeight() {
         html.scrollHeight, html.offsetHeight, html.clientHeight);
 }
 
-function log(...args) {
-    if (settings.isDevelopment) {
-        console.log('Sticky Ducky: ', ...args);
-    }
-}
-
 function measure(label, f) {
     if (!settings.isDevelopment) return f();
     const before = window.performance.now();
@@ -222,11 +290,15 @@ function classify(el) {
 }
 
 function onNewSettings(newSettings) {
+    log('onNewSettings called with:', newSettings);
     // The new settings may contain only the updated properties
     _.extend(settings, newSettings);
+    log('Settings after update:', settings);
     if (document.readyState === 'loading') {
+        log('Document still loading, waiting for DOMContentLoaded');
         document.addEventListener('DOMContentLoaded', activateSettings);
     } else {
+        log('Document ready, activating settings immediately');
         activateSettings();
     }
 }
@@ -266,7 +338,7 @@ let exploreStickies = () => {
             el.setAttribute('sticky-ducky-position', getPosition(el));
         }
     });
-    log('explored stickies', els);
+    log('Explored stickies', els);
 };
 
 let getPosition = el => {
@@ -320,26 +392,43 @@ function onSheetExplored(result) {
     }
     if (result.href) {
         let sheetInfo = exploration.externalSheets[result.href];
+        let newSheetInfo = null;
         if (result.status === 'fail') {
-            if (sheetInfo.status === 'unexplored') {
-                exploration.externalSheets[result.href] = {
-                    status: 'awaitingBackgroundFetch',
+            // It can fail because of CORS
+            warn('Failed to explore sheet on the content page:', result);
+            if (sheetInfo && sheetInfo.status === 'unexplored') {
+                newSheetInfo = {
+                    status: 'awaitingServiceWorkerFetch',
                     error: result.error
                 };
-                vAPI.sendToBackground('exploreSheet', {
-                    href: result.href, baseURI: result.baseURI
+                sendMessageToServiceWorker({
+                    name: 'exploreSheet',
+                    message: {href: result.href, baseURI: result.baseURI}
+                }).then(response => {
+                    log('ExploreSheet response:', response);
+                    if (response && response.name === 'sheetExplored') {
+                        onSheetExplored(response.message);
+                    }
+                }).catch(err => {
+                    error('Failed to explore sheet on the service worker:', err);
+                    // Mark as failed so we don't keep retrying
+                    exploration.externalSheets[result.href] = {
+                        status: 'fail',
+                        error: err.message
+                    };
                 });
             } else {
-                exploration.externalSheets[result.href] = {
+                 newSheetInfo = {
                     status: 'fail',
                     error: result.error
                 };
             }
         } else if (result.status === 'success') {
-            exploration.externalSheets[result.href] = {
+            newSheetInfo = {
                 status: 'success'
             };
         }
+        exploration.externalSheets[result.href] = newSheetInfo;
     }
 }
 
@@ -366,6 +455,10 @@ function onNewSelectors(selectorDescriptions) {
 }
 
 function doAll(forceExplore, settingsChanged, ev) {
+    if (!stickyFixer) {
+        // This may happen if the doAll is scheduled asynchronously, and the sticky ducky got disabled. That could be done with whitelist or "always" behavior.
+        return;
+    }
     let forceUpdate = settingsChanged;
     let scrollInfo = {
         scrollY: window.scrollY,
@@ -400,12 +493,79 @@ function doAll(forceExplore, settingsChanged, ev) {
 }
 
 if (window.top === window) {  // Don't do anything within an iframe
-    vAPI.listen('settings', settings => onNewSettings(settings));
-    vAPI.listen('sheetExplored', message => onSheetExplored(message));
-    vAPI.sendToBackground('getSettings', {location: _.omit(window.location, _.isFunction)});
+    log('Content script initializing (top window)');
+    
+    // Listen for messages from service worker (for pushed updates)
+    chrome.runtime.onMessage.addListener((request) => {
+        log('Content script received message:', request.name);
+        if (request.name === 'temporaryShowStickies') {
+            // Show once. Disabling the stylesheet is simpler than setting and resetting the behavior.
+            if (stickyFixer && stickyFixer.stylesheet) {
+                stickyFixer.stylesheet.disabled = true;
+            }
+        
+            // Restore the previous behavior after a short delay
+            setTimeout(() => {
+                if (stickyFixer && stickyFixer.stylesheet) {
+                    stickyFixer.stylesheet.disabled = false;
+                }
+            }, 1000);
+        } else if (request.name === 'sheetExplored') {
+            log('Processing sheetExplored message:', request.message);
+            onSheetExplored(request.message);
+        }
+    });
+    
+    // Request initial settings
+    log('Requesting initial settings...');
+    refreshSettings('initialization');
+
+    // Listen for storage changes
+    chrome.storage.onChanged.addListener((changes) => {
+        log('Storage changed:', changes);
+        
+        // Add a small delay to avoid race conditions with page navigation
+        setTimeout(() => {
+            // Check if we're still the active content script
+            if (window.top !== window || document.hidden) {
+                log('Skipping settings refresh - not active window');
+                return;
+            }
+            
+            // Retrieve settings again when storage changes
+            refreshSettings('storage-change');
+        }, 100); // Small delay to avoid race conditions
+    });
 
     document.addEventListener('readystatechange', () => {
+        log('Document ready state changed to:', document.readyState);
         // Run several times waiting for JS on the page to do the changes affecting scrolling and stickies
         [0, 500].forEach(t => setTimeout(() => stickyFixer && doAll(true, false), t));
     });
+
+    // Listen for tab becoming active/visible to refresh settings
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            log('Tab became visible');
+            refreshSettings('tab-visible');
+        }
+    });
+
+    // Listen for window focus (additional activation detection)
+    window.addEventListener('focus', () => {
+        log('Window gained focus');
+        refreshSettings('window-focus');
+    });
+
+    // Listen for pageshow (back/forward navigation)
+    window.addEventListener('pageshow', (event) => {
+        if (event.persisted) {
+            log('Page shown from cache');
+            refreshSettings('pageshow-cache');
+        }
+    });
+    
+    log('Content script initialization complete');
+} else {
+    log('Content script skipped (iframe)');
 }
